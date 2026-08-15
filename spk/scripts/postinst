@@ -1,0 +1,208 @@
+#!/bin/sh
+# DSM 7 post-install script. Keep it conservative: non-zero postinst marks
+# the package corrupted, so runtime checks belong in start-stop-status.
+set -u
+
+PKG="iptv-transcoder"
+PKG_USER="$PKG"
+PKG_DIR="/var/packages/${PKG}"
+TARGET="${SYNOPKG_PKGDEST:-$PKG_DIR/target}"
+
+resolve_var_dir() {
+  if [ -n "${SYNOPKG_PKGVAR:-}" ] && [ "${SYNOPKG_PKGVAR:-}" != "$PKG_DIR/var" ]; then
+    printf '%s\n' "$SYNOPKG_PKGVAR"
+    return 0
+  fi
+  for dir in "/volume1/@appdata/${PKG}" "/volume2/@appdata/${PKG}" "/volume3/@appdata/${PKG}"; do
+    if [ -d "$dir" ] || mkdir -p "$dir" 2>/dev/null; then
+      printf '%s\n' "$dir"
+      return 0
+    fi
+  done
+  printf '%s\n' "$PKG_DIR/var"
+}
+
+VAR_DIR="$(resolve_var_dir)"
+RUN_DIR="$VAR_DIR/run"
+LOG_DIR="$VAR_DIR/logs"
+HLS_DIR="$VAR_DIR/hls"
+ENV_FILE="$VAR_DIR/env"
+INSTALL_LOG="$LOG_DIR/install.log"
+TEMP_LOG="${SYNOPKG_TEMP_LOGFILE:-}"
+
+say() {
+  msg="$*"
+  mkdir -p "$LOG_DIR" 2>/dev/null || true
+  printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo now)" "$msg" >> "$INSTALL_LOG" 2>/dev/null || true
+  [ -n "$TEMP_LOG" ] && printf '%s\n' "$msg" >> "$TEMP_LOG" 2>/dev/null || true
+}
+
+gen_key() {
+  if command -v openssl >/dev/null 2>&1; then
+    openssl rand -hex 24 2>/dev/null && return 0
+  fi
+  if [ -r /proc/sys/kernel/random/uuid ]; then
+    uuid1="$(cat /proc/sys/kernel/random/uuid 2>/dev/null | tr -d '-')"
+    uuid2="$(cat /proc/sys/kernel/random/uuid 2>/dev/null | tr -d '-')"
+    printf '%s%s\n' "$uuid1" "$uuid2" | cut -c1-48
+    return 0
+  fi
+  printf '%s-%s-%s\n' "$(date +%s 2>/dev/null || echo 0)" "$$" "${RANDOM:-0}" | cksum | awk '{print $1}'
+}
+
+ensure_api_key() {
+  [ -f "$ENV_FILE" ] || return 0
+  current="$(grep '^IPTV_TRANSCODER_API_KEY=' "$ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2- || true)"
+  [ -n "$current" ] && return 0
+  API_KEY="$(gen_key 2>/dev/null || echo iptv-transcoder-change-me)"
+  say "api key missing or empty; generated replacement in $ENV_FILE"
+  tmp="$ENV_FILE.tmp.$$"
+  replaced=0
+  : > "$tmp" 2>/dev/null || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      IPTV_TRANSCODER_API_KEY=*)
+        if [ "$replaced" -eq 0 ]; then
+          printf 'IPTV_TRANSCODER_API_KEY=%s\n' "$API_KEY" >> "$tmp"
+          replaced=1
+        fi
+        ;;
+      *) printf '%s\n' "$line" >> "$tmp" ;;
+    esac
+  done < "$ENV_FILE"
+  if ! grep -q '^IPTV_TRANSCODER_API_KEY=' "$ENV_FILE" 2>/dev/null; then
+    printf 'IPTV_TRANSCODER_API_KEY=%s\n' "$API_KEY" >> "$tmp"
+  fi
+  mv "$tmp" "$ENV_FILE" 2>/dev/null || rm -f "$tmp"
+  chmod 600 "$ENV_FILE" 2>/dev/null || true
+}
+
+repair_runtime_permissions() {
+  mkdir -p "$VAR_DIR" "$HLS_DIR" "$LOG_DIR" "$RUN_DIR" 2>/dev/null || return 0
+  if id "$PKG_USER" >/dev/null 2>&1; then
+    chown -R "$PKG_USER" "$VAR_DIR" 2>/dev/null || say "runtime permission: chown $VAR_DIR to $PKG_USER failed"
+  else
+    say "runtime permission: package user $PKG_USER not found yet; skip chown"
+  fi
+  chmod 700 "$VAR_DIR" "$LOG_DIR" "$RUN_DIR" "$HLS_DIR" 2>/dev/null || true
+  [ -f "$ENV_FILE" ] && chmod 600 "$ENV_FILE" 2>/dev/null || true
+  [ -f "$VAR_DIR/channels.json" ] && chmod 600 "$VAR_DIR/channels.json" 2>/dev/null || true
+}
+
+ensure_videodriver_group() {
+  group="videodriver"
+  user="$PKG"
+
+  if ! id "$user" >/dev/null 2>&1; then
+    say "hardware permission: package user $user not found yet; skip $group membership"
+    return 0
+  fi
+
+  if id "$user" 2>/dev/null | grep -q "($group)"; then
+    say "hardware permission: $user is already in $group"
+    return 0
+  fi
+
+  if command -v synogroup >/dev/null 2>&1; then
+    if synogroup --memberadd "$group" "$user" >>"$INSTALL_LOG" 2>&1; then
+      say "hardware permission: added $user to $group via synogroup --memberadd"
+    else
+      say "hardware permission: synogroup --memberadd $group $user failed; manual command may be needed"
+    fi
+  else
+    say "hardware permission: synogroup command not found; manual $group membership may be needed"
+  fi
+
+  if id "$user" 2>/dev/null | grep -q "($group)"; then
+    say "hardware permission: verified $user groups=$(id "$user" 2>/dev/null || true)"
+  else
+    say "hardware permission: $user is not in $group; QSV may fail until running: synogroup --memberadd $group $user"
+  fi
+}
+
+mkdir -p "$VAR_DIR" "$HLS_DIR" "$LOG_DIR" "$RUN_DIR" 2>/dev/null || true
+repair_runtime_permissions
+say "postinst start target=$TARGET var=$VAR_DIR run=$RUN_DIR user=$(id 2>/dev/null || true)"
+ensure_videodriver_group
+
+if [ ! -f "$VAR_DIR/channels.json" ]; then
+  if [ -f "$TARGET/examples/channels.example.json" ]; then
+    cp "$TARGET/examples/channels.example.json" "$VAR_DIR/channels.json" 2>>"$INSTALL_LOG" || printf '{}\n' > "$VAR_DIR/channels.json" 2>/dev/null || true
+  else
+    printf '{}\n' > "$VAR_DIR/channels.json" 2>/dev/null || true
+  fi
+fi
+
+if [ ! -f "$ENV_FILE" ]; then
+  API_KEY="$(gen_key 2>/dev/null || echo iptv-transcoder-change-me)"
+  cat > "$ENV_FILE" <<EOF 2>/dev/null || true
+IPTV_TRANSCODER_HOST=0.0.0.0
+IPTV_TRANSCODER_PORT=18096
+IPTV_TRANSCODER_MANAGEMENT_PORT=18097
+IPTV_TRANSCODER_PUBLIC_BASE_URL=http://NAS_IP:18096
+IPTV_TRANSCODER_API_KEY=$API_KEY
+IPTV_TRANSCODER_FFMPEG=/var/packages/Jellyfin/target/bin/ffmpeg
+IPTV_TRANSCODER_FFPROBE=/var/packages/Jellyfin/target/bin/ffprobe
+IPTV_TRANSCODER_QSV_DEVICE=/dev/dri/renderD128
+IPTV_TRANSCODER_ALLOWED_UPSTREAMS=192.168.10.1:7088
+IPTV_TRANSCODER_HARDWARE_ONLY=1
+IPTV_TRANSCODER_MAX_TRANSCODES=5
+IPTV_TRANSCODER_IDLE_TIMEOUT=10
+IPTV_TRANSCODER_GLOBAL_QUALITY=23
+IPTV_TRANSCODER_GLOBAL_QUALITY_4K=24
+IPTV_TRANSCODER_QSV_LOW_POWER_H264=1
+IPTV_TRANSCODER_QSV_LOW_POWER_720P_LOW_BITRATE=2500k
+IPTV_TRANSCODER_QSV_LOW_POWER_720P_LOW_MAXRATE=3000k
+IPTV_TRANSCODER_QSV_LOW_POWER_720P_LOW_BUFSIZE=6000k
+IPTV_TRANSCODER_QSV_LOW_POWER_720P_MEDIUM_BITRATE=3500k
+IPTV_TRANSCODER_QSV_LOW_POWER_720P_MEDIUM_MAXRATE=4000k
+IPTV_TRANSCODER_QSV_LOW_POWER_720P_MEDIUM_BUFSIZE=8000k
+IPTV_TRANSCODER_QSV_LOW_POWER_720P_HIGH_BITRATE=5000k
+IPTV_TRANSCODER_QSV_LOW_POWER_720P_HIGH_MAXRATE=6000k
+IPTV_TRANSCODER_QSV_LOW_POWER_720P_HIGH_BUFSIZE=12000k
+IPTV_TRANSCODER_QSV_LOW_POWER_1080P_LOW_BITRATE=4500k
+IPTV_TRANSCODER_QSV_LOW_POWER_1080P_LOW_MAXRATE=5000k
+IPTV_TRANSCODER_QSV_LOW_POWER_1080P_LOW_BUFSIZE=10000k
+IPTV_TRANSCODER_QSV_LOW_POWER_1080P_MEDIUM_BITRATE=6000k
+IPTV_TRANSCODER_QSV_LOW_POWER_1080P_MEDIUM_MAXRATE=7000k
+IPTV_TRANSCODER_QSV_LOW_POWER_1080P_MEDIUM_BUFSIZE=14000k
+IPTV_TRANSCODER_QSV_LOW_POWER_1080P_HIGH_BITRATE=8000k
+IPTV_TRANSCODER_QSV_LOW_POWER_1080P_HIGH_MAXRATE=9000k
+IPTV_TRANSCODER_QSV_LOW_POWER_1080P_HIGH_BUFSIZE=18000k
+IPTV_TRANSCODER_QSV_LOW_POWER_2K_LOW_BITRATE=7000k
+IPTV_TRANSCODER_QSV_LOW_POWER_2K_LOW_MAXRATE=8000k
+IPTV_TRANSCODER_QSV_LOW_POWER_2K_LOW_BUFSIZE=16000k
+IPTV_TRANSCODER_QSV_LOW_POWER_2K_MEDIUM_BITRATE=9000k
+IPTV_TRANSCODER_QSV_LOW_POWER_2K_MEDIUM_MAXRATE=10000k
+IPTV_TRANSCODER_QSV_LOW_POWER_2K_MEDIUM_BUFSIZE=20000k
+IPTV_TRANSCODER_QSV_LOW_POWER_2K_HIGH_BITRATE=12000k
+IPTV_TRANSCODER_QSV_LOW_POWER_2K_HIGH_MAXRATE=14000k
+IPTV_TRANSCODER_QSV_LOW_POWER_2K_HIGH_BUFSIZE=28000k
+IPTV_TRANSCODER_QSV_LOW_POWER_4K_LOW_BITRATE=14000k
+IPTV_TRANSCODER_QSV_LOW_POWER_4K_LOW_MAXRATE=16000k
+IPTV_TRANSCODER_QSV_LOW_POWER_4K_LOW_BUFSIZE=32000k
+IPTV_TRANSCODER_QSV_LOW_POWER_4K_MEDIUM_BITRATE=18000k
+IPTV_TRANSCODER_QSV_LOW_POWER_4K_MEDIUM_MAXRATE=20000k
+IPTV_TRANSCODER_QSV_LOW_POWER_4K_MEDIUM_BUFSIZE=40000k
+IPTV_TRANSCODER_QSV_LOW_POWER_4K_HIGH_BITRATE=25000k
+IPTV_TRANSCODER_QSV_LOW_POWER_4K_HIGH_MAXRATE=28000k
+IPTV_TRANSCODER_QSV_LOW_POWER_4K_HIGH_BUFSIZE=56000k
+IPTV_TRANSCODER_AUDIO_BITRATE=128k
+IPTV_TRANSCODER_HLS_TIME=2
+IPTV_TRANSCODER_HLS_GOP=100
+IPTV_TRANSCODER_STARTUP_PROBE_SECONDS=0.2
+IPTV_TRANSCODER_FFMPEG_STOP_TIMEOUT=1.5
+IPTV_TRANSCODER_FFPROBE_TIMEOUT=20
+IPTV_TRANSCODER_FFPROBE_ANALYZEDURATION=10000000
+IPTV_TRANSCODER_FFPROBE_PROBESIZE=20000000
+IPTV_TRANSCODER_HDR_VPP_BRIGHTNESS=8
+IPTV_TRANSCODER_HDR_VPP_CONTRAST=1
+EOF
+  chmod 600 "$ENV_FILE" 2>/dev/null || true
+fi
+ensure_api_key
+repair_runtime_permissions
+
+chmod +x "$TARGET/scripts/start-stop-status" 2>>"$INSTALL_LOG" || true
+say "postinst done"
+exit 0

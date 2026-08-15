@@ -1,0 +1,28 @@
+# Python cache/test artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv*/
+venv/
+env/
+
+# Build/package outputs
+/build/
+*.spk
+*.spk.sha256
+package.tgz
+
+# Local runtime config/secrets
+.env
+.env.*
+!.env.example
+
+# OS/editor noise
+.DS_Store
+*.swp
+*~

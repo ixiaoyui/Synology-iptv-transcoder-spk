@@ -1,0 +1,12 @@
+{
+  ".url": {
+    "com.hermes.IPTVTranscoder": {
+      "type": "url",
+      "icon": "images/icon_{0}.png",
+      "title": "IPTV Transcoder",
+      "desc": "IPTV Transcoder 管理界面",
+      "url": "3rdparty/iptv-transcoder/index.html",
+      "allUsers": true
+    }
+  }
+}

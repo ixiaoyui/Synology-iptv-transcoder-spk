@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>IPTV Transcoder 管理</title>
+  <style>
+    :root { color-scheme: light dark; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    body { margin: 0; background: #f4f6f8; color: #17202a; }
+    .wrap { max-width: 960px; margin: 0 auto; padding: 24px; }
+    .card { background: #fff; border-radius: 14px; box-shadow: 0 8px 24px rgba(15, 23, 42, .12); padding: 22px; margin-bottom: 16px; }
+    h1 { margin: 0 0 6px; font-size: 24px; }
+    h2 { font-size: 18px; margin: 0 0 14px; }
+    p { line-height: 1.6; }
+    label { display: block; font-weight: 600; margin: 12px 0 6px; }
+    input, select { box-sizing: border-box; width: 100%; border: 1px solid #cbd5e1; border-radius: 9px; padding: 10px 12px; font-size: 14px; background: #fff; }
+    .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px 18px; }
+    .actions { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 18px; }
+    button { border: 0; border-radius: 9px; padding: 10px 14px; font-weight: 700; cursor: pointer; background: #2563eb; color: #fff; }
+    button.secondary { background: #475569; }
+    button.warn { background: #b45309; }
+    pre { overflow: auto; white-space: pre-wrap; background: #0f172a; color: #e2e8f0; padding: 12px; border-radius: 9px; }
+    .hint { color: #64748b; font-size: 13px; }
+    .ok { color: #15803d; font-weight: 700; }
+    .bad { color: #b91c1c; font-weight: 700; }
+    @media (prefers-color-scheme: dark) {
+      body { background: #0b1120; color: #e5e7eb; }
+      .card { background: #111827; box-shadow: 0 8px 24px rgba(0,0,0,.35); }
+      input, select { background: #0f172a; color: #e5e7eb; border-color: #334155; }
+      .hint { color: #94a3b8; }
+    }
+    @media (max-width: 720px) { .grid { grid-template-columns: 1fr; } .wrap { padding: 14px; } }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <h1>IPTV Transcoder 管理</h1>
+      <p class="hint">这是 DSM 套件打开页（3rdparty/iptv-transcoder/index.html），不是转码服务的普通首页。服务根路径 <code>/</code> 保持 JSON 健康信息。</p>
+      <div class="grid">
+        <div>
+          <label for="serviceBase">转码服务地址</label>
+          <input id="serviceBase" value="http://NAS_IP:18096" placeholder="http://192.168.1.100:18096">
+          <div class="hint">如果页面是从 DSM 打开的，可把 NAS_IP 改为当前 NAS 局域网 IP。</div>
+        </div>
+        <div>
+          <label for="authKey">当前 API Key</label>
+          <input id="authKey" type="password" autocomplete="current-password" placeholder="输入当前 env 中的 IPTV_TRANSCODER_API_KEY">
+          <div class="hint">配置接口需要当前 API Key；不会保存在 DSM 静态页文件里。</div>
+        </div>
+      </div>
+      <div class="actions">
+        <button onclick="health()">检查服务</button>
+        <button class="secondary" onclick="loadConfig()">读取配置</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>配置</h2>
+      <div class="grid" id="form"></div>
+      <div class="actions">
+        <button onclick="saveConfig()">保存配置</button>
+        <button class="warn" onclick="fillNasHost()">用当前主机名填充 Public Base URL</button>
+      </div>
+      <p class="hint">端口、监听地址、API Key 等保存后需要在 DSM 套件中心重启 IPTV Transcoder 才会完全生效。</p>
+    </div>
+
+    <div class="card">
+      <h2>输出</h2>
+      <pre id="out">等待操作...</pre>
+    </div>
+  </div>
+<script>
+const keys = [
+  ["IPTV_TRANSCODER_HOST", "监听地址"],
+  ["IPTV_TRANSCODER_PORT", "端口"],
+  ["IPTV_TRANSCODER_PUBLIC_BASE_URL", "Public Base URL"],
+  ["IPTV_TRANSCODER_API_KEY", "API Key"],
+  ["IPTV_TRANSCODER_FFMPEG", "ffmpeg 路径"],
+  ["IPTV_TRANSCODER_FFPROBE", "ffprobe 路径"],
+  ["IPTV_TRANSCODER_QSV_DEVICE", "QSV 设备"],
+  ["IPTV_TRANSCODER_ALLOWED_UPSTREAMS", "上游白名单"],
+  ["IPTV_TRANSCODER_HARDWARE_ONLY", "仅硬件转码"],
+  ["IPTV_TRANSCODER_MAX_TRANSCODES", "最大并发"],
+  ["IPTV_TRANSCODER_IDLE_TIMEOUT", "空闲超时秒"],
+  ["IPTV_TRANSCODER_GLOBAL_QUALITY", "QSV 质量"],
+  ["IPTV_TRANSCODER_GLOBAL_QUALITY_4K", "4K QSV 质量"],
+  ["IPTV_TRANSCODER_AUDIO_BITRATE", "音频码率"],
+  ["IPTV_TRANSCODER_HDR_VPP_BRIGHTNESS", "VPP 色调映射亮度增益"],
+  ["IPTV_TRANSCODER_HDR_VPP_CONTRAST", "VPP 色调映射对比度增益"]
+];
+function out(obj) { document.getElementById('out').textContent = typeof obj === 'string' ? obj : JSON.stringify(obj, null, 2); }
+function base() { return document.getElementById('serviceBase').value.replace(/\/+$/, ''); }
+function headers() { return {'X-API-Key': document.getElementById('authKey').value, 'Content-Type': 'application/json'}; }
+function render(config = {}) {
+  const f = document.getElementById('form');
+  f.replaceChildren();
+  for (const [k, label] of keys) {
+    const box = document.createElement('div');
+    const l = document.createElement('label'); l.textContent = label; l.htmlFor = k;
+    const input = document.createElement('input'); input.id = k; input.value = config[k] || '';
+    if (k === 'IPTV_TRANSCODER_API_KEY') input.type = 'password';
+    box.appendChild(l); box.appendChild(input); f.appendChild(box);
+  }
+}
+async function health() {
+  try { const r = await fetch(base() + '/api/health'); out(await r.json()); }
+  catch (e) { out('服务检查失败：' + e); }
+}
+async function loadConfig() {
+  try {
+    const r = await fetch(base() + '/api/config', {headers: headers()});
+    const data = await r.json();
+    if (!r.ok || !data.ok) { out(data); return; }
+    render(data.config); out(data);
+  } catch (e) { out('读取配置失败：' + e); }
+}
+async function saveConfig() {
+  const body = {};
+  for (const [k] of keys) body[k] = document.getElementById(k)?.value || '';
+  try {
+    const r = await fetch(base() + '/api/config', {method: 'POST', headers: headers(), body: JSON.stringify(body)});
+    const data = await r.json(); out(data);
+    if (data.ok && body.IPTV_TRANSCODER_API_KEY) document.getElementById('authKey').value = body.IPTV_TRANSCODER_API_KEY;
+  } catch (e) { out('保存配置失败：' + e); }
+}
+function fillNasHost() {
+  const port = document.getElementById('IPTV_TRANSCODER_PORT')?.value || '18096';
+  const host = location.hostname || 'NAS_IP';
+  const url = 'http://' + host + ':' + port;
+  const publicBase = document.getElementById('IPTV_TRANSCODER_PUBLIC_BASE_URL');
+  const serviceBase = document.getElementById('serviceBase');
+  if (publicBase) publicBase.value = url;
+  if (serviceBase) serviceBase.value = url;
+}
+render();
+</script>
+</body>
+</html>

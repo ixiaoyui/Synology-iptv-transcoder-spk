@@ -1,0 +1,432 @@
+#!/bin/sh
+set -u
+
+PKG="iptv-transcoder"
+PKG_USER="$PKG"
+PKG_DIR="/var/packages/${PKG}"
+TARGET="${SYNOPKG_PKGDEST:-$PKG_DIR/target}"
+
+resolve_var_dir() {
+  if [ -n "${SYNOPKG_PKGVAR:-}" ] && [ "${SYNOPKG_PKGVAR:-}" != "$PKG_DIR/var" ]; then
+    printf '%s\n' "$SYNOPKG_PKGVAR"
+    return 0
+  fi
+  for dir in "/volume1/@appdata/${PKG}" "/volume2/@appdata/${PKG}" "/volume3/@appdata/${PKG}"; do
+    if [ -d "$dir" ] || mkdir -p "$dir" 2>/dev/null; then
+      printf '%s\n' "$dir"
+      return 0
+    fi
+  done
+  printf '%s\n' "$PKG_DIR/var"
+}
+
+VAR_DIR="$(resolve_var_dir)"
+RUN_DIR="$VAR_DIR/run"
+LOG_DIR="$VAR_DIR/logs"
+HLS_DIR="$VAR_DIR/hls"
+PID_FILE="$RUN_DIR/${PKG}.pid"
+ENV_FILE="$VAR_DIR/env"
+CHANNELS_FILE="$VAR_DIR/channels.json"
+SERVICE_LOG="$LOG_DIR/service.log"
+TEMP_LOG="${SYNOPKG_TEMP_LOGFILE:-}"
+
+say() {
+  msg="$*"
+  mkdir -p "$LOG_DIR" 2>/dev/null || true
+  printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo now)" "$msg" >> "$SERVICE_LOG" 2>/dev/null || true
+  [ -n "$TEMP_LOG" ] && printf '%s\n' "$msg" >> "$TEMP_LOG" 2>/dev/null || true
+}
+
+gen_key() {
+  if command -v openssl >/dev/null 2>&1; then
+    openssl rand -hex 24 2>/dev/null && return 0
+  fi
+  if [ -r /proc/sys/kernel/random/uuid ]; then
+    uuid1="$(cat /proc/sys/kernel/random/uuid 2>/dev/null | tr -d '-')"
+    uuid2="$(cat /proc/sys/kernel/random/uuid 2>/dev/null | tr -d '-')"
+    printf '%s%s\n' "$uuid1" "$uuid2" | cut -c1-48
+    return 0
+  fi
+  printf '%s-%s-%s\n' "$(date +%s 2>/dev/null || echo 0)" "$$" "${RANDOM:-0}" | cksum | awk '{print $1}'
+}
+
+ensure_api_key() {
+  [ -f "$ENV_FILE" ] || return 0
+  current="$(grep '^IPTV_TRANSCODER_API_KEY=' "$ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2- || true)"
+  [ -n "$current" ] && return 0
+  API_KEY="$(gen_key 2>/dev/null || echo iptv-transcoder-change-me)"
+  say "api key missing or empty; generated replacement in $ENV_FILE"
+  tmp="$ENV_FILE.tmp.$$"
+  replaced=0
+  : > "$tmp" 2>/dev/null || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      IPTV_TRANSCODER_API_KEY=*)
+        if [ "$replaced" -eq 0 ]; then
+          printf 'IPTV_TRANSCODER_API_KEY=%s\n' "$API_KEY" >> "$tmp"
+          replaced=1
+        fi
+        ;;
+      *) printf '%s\n' "$line" >> "$tmp" ;;
+    esac
+  done < "$ENV_FILE"
+  if ! grep -q '^IPTV_TRANSCODER_API_KEY=' "$ENV_FILE" 2>/dev/null; then
+    printf 'IPTV_TRANSCODER_API_KEY=%s\n' "$API_KEY" >> "$tmp"
+  fi
+  mv "$tmp" "$ENV_FILE" 2>/dev/null || rm -f "$tmp"
+  chmod 600 "$ENV_FILE" 2>/dev/null || true
+}
+
+repair_runtime_permissions() {
+  mkdir -p "$VAR_DIR" "$HLS_DIR" "$LOG_DIR" "$RUN_DIR" 2>/dev/null || return 1
+  if id "$PKG_USER" >/dev/null 2>&1; then
+    chown -R "$PKG_USER" "$VAR_DIR" 2>/dev/null || say "runtime permission: chown $VAR_DIR to $PKG_USER failed"
+  else
+    say "runtime permission: package user $PKG_USER not found yet; skip chown"
+  fi
+  chmod 700 "$VAR_DIR" "$LOG_DIR" "$RUN_DIR" "$HLS_DIR" 2>/dev/null || true
+  [ -f "$ENV_FILE" ] && chmod 600 "$ENV_FILE" 2>/dev/null || true
+  [ -f "$CHANNELS_FILE" ] && chmod 600 "$CHANNELS_FILE" 2>/dev/null || true
+}
+
+find_python() {
+  if [ -n "${PYTHON_BIN:-}" ] && [ -x "${PYTHON_BIN:-}" ]; then
+    printf '%s\n' "$PYTHON_BIN"
+    return 0
+  fi
+  for bin in \
+    /bin/python3 \
+    /usr/bin/python3 \
+    /usr/local/bin/python3 \
+    /var/packages/Python3.9/target/bin/python3 \
+    /var/packages/Python3/target/bin/python3 \
+    /bin/python \
+    /usr/bin/python \
+    /usr/local/bin/python \
+    python3 \
+    python
+  do
+    if [ -x "$bin" ]; then
+      printf '%s\n' "$bin"
+      return 0
+    fi
+    if command -v "$bin" >/dev/null 2>&1; then
+      command -v "$bin"
+      return 0
+    fi
+  done
+  return 1
+}
+
+ensure_dirs() {
+  mkdir -p "$VAR_DIR" "$HLS_DIR" "$LOG_DIR" "$RUN_DIR" 2>/dev/null || return 1
+  repair_runtime_permissions || return 1
+  [ -w "$VAR_DIR" ] && [ -w "$LOG_DIR" ] && [ -w "$RUN_DIR" ] || return 1
+  return 0
+}
+
+prepend_ld_path() {
+  dir="$1"
+  [ -d "$dir" ] || return 0
+  case ":${LD_LIBRARY_PATH:-}:" in
+    *:"$dir":*) ;;
+    *) LD_LIBRARY_PATH="$dir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" ;;
+  esac
+}
+
+setup_media_library_path() {
+  # Synology package binaries such as Jellyfin ffmpeg are often not linked with
+  # an rpath. When started by this package they need their bundled libraries in
+  # LD_LIBRARY_PATH; otherwise ffmpeg/ffprobe can fail with missing libmpg123,
+  # libx264, libmfx, etc.
+  for bin in "${IPTV_TRANSCODER_FFMPEG:-}" "${IPTV_TRANSCODER_FFPROBE:-}"; do
+    [ -n "$bin" ] || continue
+    [ -x "$bin" ] || continue
+    bin_dir="$(cd "$(dirname "$bin")" 2>/dev/null && pwd || true)"
+    target_dir="$(cd "$bin_dir/.." 2>/dev/null && pwd || true)"
+    [ -n "$target_dir" ] || continue
+    prepend_ld_path "$target_dir/lib"
+    prepend_ld_path "$target_dir/lib64"
+    prepend_ld_path "$target_dir/lib/jellyfin-ffmpeg"
+    prepend_ld_path "$target_dir/lib/ffmpeg"
+  done
+  prepend_ld_path /var/packages/Jellyfin/target/lib
+  prepend_ld_path /var/packages/Jellyfin/target/lib64
+  prepend_ld_path /var/packages/ffmpeg7/target/lib
+  prepend_ld_path /var/packages/ffmpeg/target/lib
+  export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}"
+}
+
+setup_media_runtime_env() {
+  for bin in "${IPTV_TRANSCODER_FFMPEG:-}" "${IPTV_TRANSCODER_FFPROBE:-}"; do
+    [ -n "$bin" ] || continue
+    [ -x "$bin" ] || continue
+    bin_dir="$(cd "$(dirname "$bin")" 2>/dev/null && pwd || true)"
+    target_dir="$(cd "$bin_dir/.." 2>/dev/null && pwd || true)"
+    [ -n "$target_dir" ] || continue
+    if [ -d "$target_dir/etc/OpenCL/vendors" ]; then
+      export OCL_ICD_VENDORS="$target_dir/etc/OpenCL/vendors"
+      export OPENCL_VENDOR_PATH="$target_dir/etc/OpenCL/vendors"
+    fi
+    if [ -d "$target_dir/lib/dri" ]; then
+      export LIBVA_DRIVERS_PATH="$target_dir/lib/dri"
+    fi
+    if [ -f "$target_dir/share/vulkan/icd.d/intel_icd.x86_64.json" ]; then
+      export VK_ICD_FILENAMES="$target_dir/share/vulkan/icd.d/intel_icd.x86_64.json"
+    fi
+    return 0
+  done
+  if [ -d /var/packages/Jellyfin/target/etc/OpenCL/vendors ]; then
+    export OCL_ICD_VENDORS="/var/packages/Jellyfin/target/etc/OpenCL/vendors"
+    export OPENCL_VENDOR_PATH="/var/packages/Jellyfin/target/etc/OpenCL/vendors"
+  fi
+  if [ -d /var/packages/Jellyfin/target/lib/dri ]; then
+    export LIBVA_DRIVERS_PATH="/var/packages/Jellyfin/target/lib/dri"
+  fi
+  if [ -f /var/packages/Jellyfin/target/share/vulkan/icd.d/intel_icd.x86_64.json ]; then
+    export VK_ICD_FILENAMES="/var/packages/Jellyfin/target/share/vulkan/icd.d/intel_icd.x86_64.json"
+  fi
+}
+
+preflight_hardware() {
+  if [ "${IPTV_TRANSCODER_HARDWARE_ONLY:-1}" = "0" ]; then
+    say "hardware preflight skipped: IPTV_TRANSCODER_HARDWARE_ONLY=0"
+    return 0
+  fi
+  if [ ! -e "${IPTV_TRANSCODER_QSV_DEVICE:-/dev/dri/renderD128}" ]; then
+    echo "$PKG QSV device not found: ${IPTV_TRANSCODER_QSV_DEVICE:-/dev/dri/renderD128}" >&2
+    say "$PKG QSV device not found: ${IPTV_TRANSCODER_QSV_DEVICE:-/dev/dri/renderD128}"
+    return 1
+  fi
+  if [ ! -r "${IPTV_TRANSCODER_QSV_DEVICE:-/dev/dri/renderD128}" ] || [ ! -w "${IPTV_TRANSCODER_QSV_DEVICE:-/dev/dri/renderD128}" ]; then
+    echo "$PKG cannot access QSV device: ${IPTV_TRANSCODER_QSV_DEVICE:-/dev/dri/renderD128}; check videodriver group" >&2
+    say "$PKG cannot access QSV device: ${IPTV_TRANSCODER_QSV_DEVICE:-/dev/dri/renderD128}"
+    return 1
+  fi
+  return 0
+}
+
+set_env_default() {
+  key="$1"
+  default="$2"
+  eval "current=\${$key:-}"
+  export "$key=${current:-$default}"
+}
+
+load_env() {
+  ensure_dirs || return 1
+  ensure_api_key
+  if [ -f "$ENV_FILE" ]; then
+    # shellcheck disable=SC1090
+    . "$ENV_FILE"
+  fi
+  export IPTV_TRANSCODER_HLS_ROOT="$HLS_DIR"
+  export IPTV_TRANSCODER_LOG_ROOT="$LOG_DIR"
+  export IPTV_TRANSCODER_CHANNELS="$CHANNELS_FILE"
+  export IPTV_TRANSCODER_FFMPEG="${IPTV_TRANSCODER_FFMPEG:-/var/packages/Jellyfin/target/bin/ffmpeg}"
+  export IPTV_TRANSCODER_FFPROBE="${IPTV_TRANSCODER_FFPROBE:-/var/packages/Jellyfin/target/bin/ffprobe}"
+  export IPTV_TRANSCODER_HOST="${IPTV_TRANSCODER_HOST:-0.0.0.0}"
+  export IPTV_TRANSCODER_PORT="${IPTV_TRANSCODER_PORT:-18096}"
+  export IPTV_TRANSCODER_MANAGEMENT_PORT="${IPTV_TRANSCODER_MANAGEMENT_PORT:-18097}"
+  export IPTV_TRANSCODER_PUBLIC_BASE_URL="${IPTV_TRANSCODER_PUBLIC_BASE_URL:-http://127.0.0.1:${IPTV_TRANSCODER_PORT}}"
+  export IPTV_TRANSCODER_QSV_DEVICE="${IPTV_TRANSCODER_QSV_DEVICE:-/dev/dri/renderD128}"
+  export IPTV_TRANSCODER_ALLOWED_UPSTREAMS="${IPTV_TRANSCODER_ALLOWED_UPSTREAMS:-192.168.10.1:7088}"
+  export IPTV_TRANSCODER_API_KEY="${IPTV_TRANSCODER_API_KEY:-}"
+  export IPTV_TRANSCODER_HARDWARE_ONLY="${IPTV_TRANSCODER_HARDWARE_ONLY:-1}"
+  export IPTV_TRANSCODER_MAX_TRANSCODES="${IPTV_TRANSCODER_MAX_TRANSCODES:-5}"
+  export IPTV_TRANSCODER_IDLE_TIMEOUT="${IPTV_TRANSCODER_IDLE_TIMEOUT:-10}"
+  export IPTV_TRANSCODER_GLOBAL_QUALITY="${IPTV_TRANSCODER_GLOBAL_QUALITY:-23}"
+  export IPTV_TRANSCODER_GLOBAL_QUALITY_4K="${IPTV_TRANSCODER_GLOBAL_QUALITY_4K:-24}"
+  export IPTV_TRANSCODER_QSV_LOW_POWER_H264="${IPTV_TRANSCODER_QSV_LOW_POWER_H264:-1}"
+  export IPTV_TRANSCODER_AUDIO_BITRATE="${IPTV_TRANSCODER_AUDIO_BITRATE:-128k}"
+  export IPTV_TRANSCODER_HLS_TIME="${IPTV_TRANSCODER_HLS_TIME:-2}"
+  export IPTV_TRANSCODER_HLS_GOP="${IPTV_TRANSCODER_HLS_GOP:-100}"
+  export IPTV_TRANSCODER_HLS_TTL_SECONDS="${IPTV_TRANSCODER_HLS_TTL_SECONDS:-3600}"
+  export IPTV_TRANSCODER_HLS_MAX_BYTES="${IPTV_TRANSCODER_HLS_MAX_BYTES:-2147483648}"
+  export IPTV_TRANSCODER_STARTUP_PROBE_SECONDS="${IPTV_TRANSCODER_STARTUP_PROBE_SECONDS:-0.2}"
+  export IPTV_TRANSCODER_FFMPEG_STOP_TIMEOUT="${IPTV_TRANSCODER_FFMPEG_STOP_TIMEOUT:-1.5}"
+  export IPTV_TRANSCODER_FFPROBE_TIMEOUT="${IPTV_TRANSCODER_FFPROBE_TIMEOUT:-20}"
+  export IPTV_TRANSCODER_FFPROBE_ANALYZEDURATION="${IPTV_TRANSCODER_FFPROBE_ANALYZEDURATION:-10000000}"
+  export IPTV_TRANSCODER_FFPROBE_PROBESIZE="${IPTV_TRANSCODER_FFPROBESIZE:-${IPTV_TRANSCODER_FFPROBE_PROBESIZE:-20000000}}"
+  export IPTV_TRANSCODER_HDR_VPP_BRIGHTNESS="${IPTV_TRANSCODER_HDR_VPP_BRIGHTNESS:-8}"
+  export IPTV_TRANSCODER_HDR_VPP_CONTRAST="${IPTV_TRANSCODER_HDR_VPP_CONTRAST:-1}"
+  set_env_default IPTV_TRANSCODER_QSV_LOW_POWER_720P_LOW_BITRATE 2500k
+  set_env_default IPTV_TRANSCODER_QSV_LOW_POWER_720P_LOW_MAXRATE 3000k
+  set_env_default IPTV_TRANSCODER_QSV_LOW_POWER_720P_LOW_BUFSIZE 6000k
+  set_env_default IPTV_TRANSCODER_QSV_LOW_POWER_720P_MEDIUM_BITRATE 3500k
+  set_env_default IPTV_TRANSCODER_QSV_LOW_POWER_720P_MEDIUM_MAXRATE 4000k
+  set_env_default IPTV_TRANSCODER_QSV_LOW_POWER_720P_MEDIUM_BUFSIZE 8000k
+  set_env_default IPTV_TRANSCODER_QSV_LOW_POWER_720P_HIGH_BITRATE 5000k
+  set_env_default IPTV_TRANSCODER_QSV_LOW_POWER_720P_HIGH_MAXRATE 6000k
+  set_env_default IPTV_TRANSCODER_QSV_LOW_POWER_720P_HIGH_BUFSIZE 12000k
+  set_env_default IPTV_TRANSCODER_QSV_LOW_POWER_1080P_LOW_BITRATE 4500k
+  set_env_default IPTV_TRANSCODER_QSV_LOW_POWER_1080P_LOW_MAXRATE 5000k
+  set_env_default IPTV_TRANSCODER_QSV_LOW_POWER_1080P_LOW_BUFSIZE 10000k
+  set_env_default IPTV_TRANSCODER_QSV_LOW_POWER_1080P_MEDIUM_BITRATE 6000k
+  set_env_default IPTV_TRANSCODER_QSV_LOW_POWER_1080P_MEDIUM_MAXRATE 7000k
+  set_env_default IPTV_TRANSCODER_QSV_LOW_POWER_1080P_MEDIUM_BUFSIZE 14000k
+  set_env_default IPTV_TRANSCODER_QSV_LOW_POWER_1080P_HIGH_BITRATE 8000k
+  set_env_default IPTV_TRANSCODER_QSV_LOW_POWER_1080P_HIGH_MAXRATE 9000k
+  set_env_default IPTV_TRANSCODER_QSV_LOW_POWER_1080P_HIGH_BUFSIZE 18000k
+  set_env_default IPTV_TRANSCODER_QSV_LOW_POWER_2K_LOW_BITRATE 7000k
+  set_env_default IPTV_TRANSCODER_QSV_LOW_POWER_2K_LOW_MAXRATE 8000k
+  set_env_default IPTV_TRANSCODER_QSV_LOW_POWER_2K_LOW_BUFSIZE 16000k
+  set_env_default IPTV_TRANSCODER_QSV_LOW_POWER_2K_MEDIUM_BITRATE 9000k
+  set_env_default IPTV_TRANSCODER_QSV_LOW_POWER_2K_MEDIUM_MAXRATE 10000k
+  set_env_default IPTV_TRANSCODER_QSV_LOW_POWER_2K_MEDIUM_BUFSIZE 20000k
+  set_env_default IPTV_TRANSCODER_QSV_LOW_POWER_2K_HIGH_BITRATE 12000k
+  set_env_default IPTV_TRANSCODER_QSV_LOW_POWER_2K_HIGH_MAXRATE 14000k
+  set_env_default IPTV_TRANSCODER_QSV_LOW_POWER_2K_HIGH_BUFSIZE 28000k
+  set_env_default IPTV_TRANSCODER_QSV_LOW_POWER_4K_LOW_BITRATE 14000k
+  set_env_default IPTV_TRANSCODER_QSV_LOW_POWER_4K_LOW_MAXRATE 16000k
+  set_env_default IPTV_TRANSCODER_QSV_LOW_POWER_4K_LOW_BUFSIZE 32000k
+  set_env_default IPTV_TRANSCODER_QSV_LOW_POWER_4K_MEDIUM_BITRATE 18000k
+  set_env_default IPTV_TRANSCODER_QSV_LOW_POWER_4K_MEDIUM_MAXRATE 20000k
+  set_env_default IPTV_TRANSCODER_QSV_LOW_POWER_4K_MEDIUM_BUFSIZE 40000k
+  set_env_default IPTV_TRANSCODER_QSV_LOW_POWER_4K_HIGH_BITRATE 25000k
+  set_env_default IPTV_TRANSCODER_QSV_LOW_POWER_4K_HIGH_MAXRATE 28000k
+  set_env_default IPTV_TRANSCODER_QSV_LOW_POWER_4K_HIGH_BUFSIZE 56000k
+  setup_media_library_path
+  setup_media_runtime_env
+  export PYTHONPATH="$TARGET/lib"
+}
+
+is_our_pid() {
+  pid="$1"
+  [ -n "$pid" ] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  # Avoid /proc/cmdline races while the process exits; ps failure simply means not running.
+  ps -p "$pid" -o args= 2>/dev/null | grep -q 'iptvtranscoder.server'
+}
+
+pid_value() {
+  [ -f "$PID_FILE" ] || return 1
+  cat "$PID_FILE" 2>/dev/null || true
+}
+
+is_running() {
+  pid="$(pid_value 2>/dev/null || true)"
+  is_our_pid "$pid"
+}
+
+rotate_service_log() {
+  if [ -f "$SERVICE_LOG" ]; then
+    size="$(wc -c < "$SERVICE_LOG" 2>/dev/null || echo 0)"
+    if [ "$size" -gt 5242880 ]; then
+      mv "$SERVICE_LOG" "$SERVICE_LOG.1" 2>/dev/null || true
+    fi
+  fi
+}
+
+write_diag() {
+  {
+    echo "===== diagnostic $(date 2>/dev/null || true) ====="
+    echo "event=${1:-unknown}"
+    echo "uid=$(id 2>/dev/null || true)"
+    echo "PKG_DIR=$PKG_DIR TARGET=$TARGET VAR_DIR=$VAR_DIR RUN_DIR=$RUN_DIR LOG_DIR=$LOG_DIR"
+    echo "SYNOPKG_PKGDEST=${SYNOPKG_PKGDEST:-} SYNOPKG_PKGVAR=${SYNOPKG_PKGVAR:-} SYNOPKG_PKG_STATUS=${SYNOPKG_PKG_STATUS:-}"
+    ls -ld "$PKG_DIR" "$TARGET" "$VAR_DIR" "$RUN_DIR" "$LOG_DIR" 2>&1 || true
+    echo "PID_FILE=$PID_FILE pid=$(pid_value 2>/dev/null || true)"
+    echo "python=$(find_python 2>/dev/null || true)"
+    echo "env=$ENV_FILE channels=$CHANNELS_FILE"
+    echo "===== end diagnostic ====="
+  } >> "$SERVICE_LOG" 2>/dev/null || true
+}
+
+start_service() {
+  load_env || {
+    echo "$PKG failed to prepare writable runtime directory: $VAR_DIR" >&2
+    say "$PKG failed to prepare writable runtime directory: $VAR_DIR"
+    write_diag start-dir-failed
+    exit 1
+  }
+  if is_running; then
+    echo "$PKG already running"
+    exit 0
+  fi
+  if [ ! -f "$CHANNELS_FILE" ] && [ -f "$TARGET/examples/channels.example.json" ]; then
+    cp "$TARGET/examples/channels.example.json" "$CHANNELS_FILE" 2>/dev/null || printf '{}\n' > "$CHANNELS_FILE" 2>/dev/null || true
+  fi
+  PY="$(find_python 2>/dev/null || true)"
+  if [ -z "$PY" ]; then
+    echo "$PKG cannot find python/python3; install DSM Python3 or set PYTHON_BIN in $ENV_FILE" >&2
+    say "$PKG cannot find python/python3"
+    write_diag no-python
+    exit 1
+  fi
+  preflight_hardware || {
+    write_diag hardware-preflight-failed
+    exit 1
+  }
+  rotate_service_log
+  {
+    echo "===== starting $(date 2>/dev/null || true) ====="
+    echo "uid=$(id 2>/dev/null || true)"
+    echo "python=$PY target=$TARGET var=$VAR_DIR"
+    PYTHONPATH="$TARGET/lib" "$PY" -c 'import sys, iptvtranscoder.server; print("module_check=ok", sys.version.replace("\n", " "))'
+  } >> "$SERVICE_LOG" 2>&1 || {
+    echo "$PKG module check failed; see $SERVICE_LOG" >&2
+    write_diag module-check-failed
+    exit 1
+  }
+  cd "$TARGET" 2>/dev/null || true
+  nohup "$PY" -m iptvtranscoder.server >> "$SERVICE_LOG" 2>&1 &
+  echo $! > "$PID_FILE"
+  sleep 2
+  if is_running; then
+    echo "$PKG started pid=$(cat "$PID_FILE")"
+    exit 0
+  fi
+  rm -f "$PID_FILE"
+  echo "$PKG failed to start; see $SERVICE_LOG" >&2
+  write_diag start-failed
+  exit 1
+}
+
+stop_service() {
+  pid="$(pid_value 2>/dev/null || true)"
+  if is_our_pid "$pid"; then
+    kill "$pid" 2>/dev/null || true
+    i=0
+    while is_our_pid "$pid" && [ "$i" -lt 20 ]; do
+      sleep 1
+      i=$((i+1))
+    done
+    if is_our_pid "$pid"; then
+      kill -9 "$pid" 2>/dev/null || true
+    fi
+  fi
+  rm -f "$PID_FILE"
+  echo "$PKG stopped"
+}
+
+case "${1:-}" in
+  prestart|prestop)
+    exit 0
+    ;;
+  start)
+    start_service
+    ;;
+  stop)
+    stop_service
+    ;;
+  status)
+    if is_running; then
+      echo "running"
+      exit 0
+    fi
+    if [ -f "$PID_FILE" ]; then
+      echo "dead with pid file"
+      exit 1
+    fi
+    echo "stopped"
+    exit 3
+    ;;
+  log)
+    tail -100 "$SERVICE_LOG" 2>/dev/null || true
+    ;;
+  *)
+    echo "Usage: $0 {start|stop|status|log|prestart|prestop}" >&2
+    exit 1
+    ;;
+esac

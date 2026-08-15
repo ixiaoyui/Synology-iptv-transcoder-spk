@@ -1,0 +1,4 @@
+#!/bin/sh
+set -eu
+# Keep /var/packages/iptv-transcoder/var by default so channel config survives reinstall.
+exit 0

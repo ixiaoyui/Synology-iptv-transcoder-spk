@@ -1,0 +1,29 @@
+{
+  "sdzy-hd": {
+    "name": "山东综艺 HD 示例：1080i 去隔行",
+    "url": "http://192.168.1.1:7088/rtp/239.x.x.x:5002",
+    "mode": "deinterlace",
+    "parity": "tff",
+    "encoder": "h264_vaapi",
+    "video_bitrate": "6000k",
+    "maxrate": "8000k",
+    "bufsize": "12000k"
+  },
+  "hevc-example": {
+    "name": "HEVC/H.265 示例：有声音没画面时转 H.264",
+    "url": "http://192.168.1.1:7088/rtp/239.x.x.x:5002",
+    "mode": "transcode",
+    "encoder": "h264_vaapi",
+    "video_bitrate": "8000k",
+    "maxrate": "10000k",
+    "bufsize": "16000k"
+  },
+  "hevc-1080i-example": {
+    "name": "HEVC + 隔行示例：转 H.264 并去隔行",
+    "url": "http://192.168.1.1:7088/rtp/239.x.x.x:5002",
+    "mode": "deinterlace_transcode",
+    "parity": "tff",
+    "encoder": "h264_vaapi",
+    "video_bitrate": "8000k"
+  }
+}
