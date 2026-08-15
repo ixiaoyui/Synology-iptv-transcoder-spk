@@ -96,6 +96,24 @@ VPP 路径可调：
 
 > **两者是同一份配置**：Web 管理界面的“保存配置”就是写这个 env 文件（原子写入）。无论用哪种方式修改，**端口 / 监听地址 / API Key / ffmpeg 路径等变更都需要在 DSM 套件中心重启 IPTV Transcoder 才完全生效**。
 
+### 第一次安装后：先找到 API Key
+
+**API Key 是安装时自动生成的随机密钥，不会显示在安装界面里，需要你自己去 env 文件里取**（Web 管理界面和 API 鉴权都要用它）：
+
+```bash
+# SSH 登录 NAS 后，按顺序找到实际存在的 env 文件：
+grep '^IPTV_TRANSCODER_API_KEY=' /volume1/@appdata/iptv-transcoder/env \
+  || grep '^IPTV_TRANSCODER_API_KEY=' /volume2/@appdata/iptv-transcoder/env \
+  || grep '^IPTV_TRANSCODER_API_KEY=' /volume3/@appdata/iptv-transcoder/env \
+  || grep '^IPTV_TRANSCODER_API_KEY=' /var/packages/iptv-transcoder/var/env
+```
+
+- 输出形如 `IPTV_TRANSCODER_API_KEY=a3f8...48位hex`，**只复制等号后面的值**填入管理页面 / IPTV Web 配置
+- 生成规则：优先 `openssl rand -hex 24`（48 位十六进制）；无 openssl 时用两个 UUID 拼接取前 48 位
+- 如果看到的是 `iptv-transcoder-change-me`，说明环境缺少随机源导致生成失败，请手动改成一个强随机值再重启套件
+- env 文件权限为 `600`，只有属主（root/package 用户）可读，普通账号需要 sudo
+- **该 Key 是内网管理密钥，请勿在聊天/公开场合泄露**；泄露后需改 env 中的值 → 重启套件 → 同步 IPTV Web 后端
+
 ### 代码/套件启动默认值（未写 env 时）
 
 与 `core.py` / `spk/scripts/start-stop-status` 一致：
@@ -162,7 +180,7 @@ IPTV_TRANSCODER_ALLOWED_UPSTREAMS=实际IP:端口
 | 字段 | 说明 |
 |------|------|
 | **转码服务地址** | 默认 `http://NAS_IP:18096`，改为 NAS 实际局域网 IP（如 `http://192.168.1.100:18096`） |
-| **当前 API Key** | 输入 `/var/packages/iptv-transcoder/var/env` 中 `IPTV_TRANSCODER_API_KEY` 的值（**只复制等号后面的值**） |
+| **当前 API Key** | 输入 env 中 `IPTV_TRANSCODER_API_KEY` 的值（**只复制等号后面的值**）。第一次安装后该 Key 是自动生成的，需自己去 env 文件取，见上文 [第一次安装后：先找到 API Key](#第一次安装后先找到-api-key) |
 
 API Key 为空时服务 **fail-closed**（拒绝所有配置操作）。Key 不会保存在页面/静态文件里。
 
