@@ -444,5 +444,3 @@ tools/smoke_api.sh \
 - 刚启动后的 heartbeat 可能短暂返回 `starting`、`missing_playlist`、`empty_playlist` 或 `missing_segments`
 - `tools/smoke_api.sh` 会把这些视为正常暖机状态并短暂重试
 - 如果 smoke 在转码生命周期检查中途失败，脚本会 best-effort 调用一次 `stop`，避免验收任务残留
-
-Web 侧的联动验收顺序见配套项目 `iptv-web` 的 `tools/README.smoke.md`。
