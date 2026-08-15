@@ -6,6 +6,25 @@
 2. **只有声音没有画面**：HEVC/H.265、MPEG-2 Video 等浏览器/MSE 不兼容源通过 QSV 转成 H.264 HLS。
 3. **HDR10/HLG 颜色不对或浏览器不兼容**：仅在 **HEVC → H.264** 且源带 HDR transfer 时做 HDR→SDR，输出 BT.709。
 
+## 它转码的是什么（输入 / 输出）
+
+**输入是 RTP 流**，典型来源是运营商 IPTV 的组播/单播 RTP 频道，通常由一个 HTTP 单播代理提供（把 RTP 封装成 HTTP 拉流，浏览器才能访问）：
+
+```text
+运营商 IPTV 组播 RTP 源
+   -> HTTP 单播代理（如 http://192.168.1.1:7088/rtp/239.x.x.x:5002）
+   -> IPTV Transcoder（本套件，按需转码）
+   -> HLS 分片（H.264 / AAC）
+   -> 浏览器 / hls.js 播放
+```
+
+- 调用方通过 `input_url` 传入 RTP 流地址，形如 `http://上游IP:端口/rtp/<组播地址>:<端口>`（示例 `http://192.168.1.1:7088/rtp/239.1.1.1:5002`）
+- 套件**不直接收组播 UDP**，而是消费上游 HTTP 单播代理吐出的 RTP-over-HTTP 流
+- 上游 `host:port` 必须在 `IPTV_TRANSCODER_ALLOWED_UPSTREAMS` 白名单内（默认 `192.168.1.1:7088`），否则返回 403 —— 防止把套件当任意 URL 转码器滥用
+- 输出始终是 **HLS**（`.m3u8` + `.ts` 分片），编码 H.264 + AAC，浏览器可直接播放
+
+> 如果你没有 HTTP 单播代理，也可以让上游直接暴露 `udp://` 或 RTP 端口，但 ffmpeg 输入路径需自行适配；本套件按 `http(s)://` 输入校验（`input_url must be http(s)`）。
+
 当前包版本：`0.1.0-055`（`spk/INFO`）。HTTP 服务内部字符串为 `0.2.0`，以 SPK 包版本为准。
 
 ## 硬件链路（源码实际行为）
