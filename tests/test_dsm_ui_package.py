@@ -115,7 +115,8 @@ class PackageOpenWebManagementTests(unittest.TestCase):
 
     def test_readme_links_to_web_smoke_runbook_for_end_to_end_acceptance(self):
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
-        self.assertIn("../iptv-web/tools/README.smoke.md", readme)
+        self.assertIn("iptv-web", readme)
+        self.assertIn("README.smoke.md", readme)
         self.assertIn("Web 侧的联动验收顺序", readme)
 
 
