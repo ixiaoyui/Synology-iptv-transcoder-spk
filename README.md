@@ -85,11 +85,16 @@ VPP 路径可调：
 
 1. 在 DSM 套件中心选择“手动安装”。
 2. 上传 `iptv-transcoder-0.1.0-055-x86_64.spk`。
-3. 安装完成后编辑：
+3. 安装完成后配置运行参数，**两种方式任选其一**：
 
-```text
-/var/packages/iptv-transcoder/var/env
-```
+   - **方式 A（推荐）：Web 管理界面** — 打开 `http://NAS_IP:18097`，填好转码服务地址和 API Key 后，在“配置”栏直接修改并保存。无需 SSH 编辑文件。
+   - **方式 B：编辑 env 文件** —
+
+   ```text
+   /var/packages/iptv-transcoder/var/env
+   ```
+
+> **两者是同一份配置**：Web 管理界面的“保存配置”就是写这个 env 文件（原子写入）。无论用哪种方式修改，**端口 / 监听地址 / API Key / ffmpeg 路径等变更都需要在 DSM 套件中心重启 IPTV Transcoder 才完全生效**。
 
 ### 代码/套件启动默认值（未写 env 时）
 
